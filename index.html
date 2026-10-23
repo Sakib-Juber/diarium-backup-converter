@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Diarium Backup Converter (Privacy-First)</title>
+  <!-- SQL.js library with explicit WASM locateFile configuration -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+  <script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-hover: #0284c7;
+      --success: #22c55e;
+      --danger: #ef4444;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+      line-height: 1.5;
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+    }
+
+    h1 { margin: 0; font-size: 1.5rem; color: var(--accent); }
+    .status-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      background: #334155;
+      color: var(--muted);
+    }
+    .status-badge.ready { background: #166534; color: #4ade80; }
+    .status-badge.loading { background: #854d0e; color: #fef08a; }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 32px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background-color 0.2s;
+    }
+
+    .drop-zone:hover, .drop-zone.dragover {
+      border-color: var(--accent);
+      background: rgba(56, 189, 248, 0.05);
+    }
+
+    .btn {
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-right: 8px;
+      margin-top: 8px;
+    }
+
+    .btn:hover { background: var(--accent-hover); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .preview-box {
+      max-height: 400px;
+      overflow-y: auto;
+      background: #090d16;
+      padding: 16px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+      line-height: 1.6;
+    }
+
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Diarium Backup Converter</h1>
+      <span id="engineStatus" class="status-badge loading">Initializing SQLite Engine...</span>
+    </header>
+
+    <div class="card">
+      <div id="dropZone" class="drop-zone">
+        <p style="margin: 0 0 8px 0; font-size: 1.1rem;">Drag & drop your <strong>.diary</strong> or <strong>.diarium</strong> file here</p>
+        <p style="margin: 0; color: var(--muted); font-size: 0.9rem;">or click to select file from your computer</p>
+        <input type="file" id="fileInput" accept=".diary,.diarium,.db,.sqlite" class="hidden">
+      </div>
+    </div>
+
+    <div id="statusCard" class="card hidden">
+      <h3>Database Summary</h3>
+      <div id="summaryContent"></div>
+      <div style="margin-top: 16px;">
+        <button id="exportTxtBtn" class="btn">Export Clean TXT</button>
+        <button id="exportDocxBtn" class="btn">Export DOCX</button>
+      </div>
+    </div>
+
+    <div id="previewCard" class="card hidden">
+      <h3>Clean Preview</h3>
+      <div id="previewContainer" class="preview-box"></div>
+    </div>
+  </div>
+
+  <script>
+    let dbInstance = null;
+    let parsedEntries = [];
+    let initPromise = null;
+
+    /**
+     * Converts raw HTML stored in Diarium entries into clean, readable plain text.
+     */
+    function cleanHtmlToPlainText(htmlString) {
+      if (!htmlString) return "";
+
+      const tempDiv = document.createElement("div");
+      let formatted = htmlString;
+
+      // Replace list items with clean bullet points
+      formatted = formatted.replace(/<li[^>]*>/gi, "• ");
+      formatted = formatted.replace(/<\/li>/gi, "\n");
+
+      // Handle paragraphs and line breaks
+      formatted = formatted.replace(/<\/p>/gi, "\n\n");
+      formatted = formatted.replace(/<br\s*[\/]?>/gi, "\n");
+      formatted = formatted.replace(/<\/div>/gi, "\n");
+      formatted = formatted.replace(/<\/h[1-6]>/gi, "\n\n");
+
+      tempDiv.innerHTML = formatted;
+      let text = tempDiv.textContent || tempDiv.innerText || "";
+
+      // Clean up multiple excessive blank lines (3+ newlines to double newline)
+      text = text.replace(/\n\s*\n\s*\n+/g, "\n\n").trim();
+
+      return text;
+    }
+
+    // Initialize SQL.js with explicit WASM locateFile path
+    function initSqlEngine() {
+      if (initPromise) return initPromise;
+      
+      const statusBadge = document.getElementById('engineStatus');
+      
+      initPromise = initSqlJs({
+        locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
+      }).then(SQL => {
+        dbInstance = SQL;
+        statusBadge.textContent = "SQLite Engine Ready";
+        statusBadge.className = "status-badge ready";
+        return SQL;
+      }).catch(err => {
+        console.error("Failed to load SQL.js:", err);
+        statusBadge.textContent = "Initialization Failed";
+        statusBadge.className = "status-badge";
+        statusBadge.style.background = "#991b1b";
+        statusBadge.style.color = "#fca5a5";
+        throw err;
+      });
+
+      return initPromise;
+    }
+
+    // Start loading engine immediately on page load
+    initSqlEngine();
+
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('dragover');
+      if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length) handleFile(e.target.files[0]);
+    });
+
+    async function handleFile(file) {
+      try {
+        const SQL = await initSqlEngine();
+        
+        const arrayBuffer = await file.arrayBuffer();
+        const uInt8Array = new Uint8Array(arrayBuffer);
+        const db = new SQL.Database(uInt8Array);
+
+        // Read Entries table
+        const res = db.exec("SELECT DiaryEntryId, Heading, Text FROM Entries ORDER BY DiaryEntryId ASC;");
+        if (!res.length || !res[0].values) {
+          alert("No entry records found in the backup file.");
+          return;
+        }
+
+        parsedEntries = res[0].values.map(row => {
+          const rawTick = BigInt(row[0]);
+          const ms = Number((rawTick / 10000n) - 62135596800000n);
+          const dateStr = isNaN(ms) ? "Invalid Date" : new Date(ms).toLocaleString();
+          const rawText = row[2] || "";
+          
+          return {
+            dateStr,
+            title: row[1] || "",
+            rawText: rawText,
+            cleanText: cleanHtmlToPlainText(rawText)
+          };
+        });
+
+        // Show summary & preview
+        document.getElementById('summaryContent').innerHTML = `
+          <p><strong>Total Entries Found:</strong> ${parsedEntries.length}</p>
+          <p><strong>Date Range:</strong> ${parsedEntries[0]?.dateStr} — ${parsedEntries[parsedEntries.length - 1]?.dateStr}</p>
+        `;
+        
+        document.getElementById('previewContainer').textContent = parsedEntries.slice(0, 3).map(e => 
+          `========================================\nDATE: ${e.dateStr}\nTITLE: ${e.title}\n========================================\n\n${e.cleanText}`
+        ).join('\n\n\n');
+
+        document.getElementById('statusCard').classList.remove('hidden');
+        document.getElementById('previewCard').classList.remove('hidden');
+
+      } catch (err) {
+        alert("Error processing file: " + err.message);
+      }
+    }
+
+    // Export Handlers
+    document.getElementById('exportTxtBtn').addEventListener('click', () => {
+      if (!parsedEntries.length) return;
+      const content = parsedEntries.map(e => 
+        `========================================\nDATE: ${e.dateStr}\nTITLE: ${e.title}\n========================================\n\n${e.cleanText}`
+      ).join('\n\n\n');
+      
+      downloadFile(content, 'Diarium_Backup_Export.txt', 'text/plain;charset=utf-8');
+    });
+
+    document.getElementById('exportDocxBtn').addEventListener('click', () => {
+      if (!parsedEntries.length || typeof docx === 'undefined') return;
+
+      const paragraphs = [];
+      parsedEntries.forEach(e => {
+        paragraphs.push(
+          new docx.Paragraph({
+            text: e.dateStr,
+            heading: docx.HeadingLevel.HEADING_2,
+            spaceAfter: 100,
+          })
+        );
+        if (e.title) {
+          paragraphs.push(
+            new docx.Paragraph({
+              text: e.title,
+              heading: docx.HeadingLevel.HEADING_3,
+              spaceAfter: 200,
+            })
+          );
+        }
+
+        // Split cleaned text into individual lines to maintain paragraph breaks
+        e.cleanText.split('\n').forEach(line => {
+          paragraphs.push(new docx.Paragraph({ text: line }));
+        });
+
+        paragraphs.push(
+          new docx.Paragraph({
+            text: "--------------------------------------------------------------------------------",
+            spaceBefore: 300,
+            spaceAfter: 300,
+          })
+        );
+      });
+
+      const doc = new docx.Document({
+        sections: [{ properties: {}, children: paragraphs }]
+      });
+
+      docx.Packer.toBlob(doc).then(blob => {
+        downloadFile(blob, 'Diarium_Backup_Export.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      });
+    });
+
+    function downloadFile(data, filename, type) {
+      const blob = data instanceof Blob ? data : new Blob([data], { type });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  </script>
+</body>
+</html>
