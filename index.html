@@ -3,9 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Diarium Backup Converter (Privacy-First)</title>
-  <!-- SQL.js library with explicit WASM locateFile configuration -->
+  <title>Diarium Backup Converter (Robust Obsidian Export)</title>
+  <!-- SQL.js library -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+  <!-- JSZip for generating Obsidian Markdown folder -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
   <style>
     :root {
@@ -127,7 +129,8 @@
       <h3>Database Summary</h3>
       <div id="summaryContent"></div>
       <div style="margin-top: 16px;">
-        <button id="exportTxtBtn" class="btn">Export Clean TXT</button>
+        <button id="exportObsidianZipBtn" class="btn" style="background: var(--success); color: #fff;">Export Obsidian Vault (.zip)</button>
+        <button id="exportTxtBtn" class="btn">Export Single TXT</button>
         <button id="exportDocxBtn" class="btn">Export DOCX</button>
       </div>
     </div>
@@ -143,20 +146,13 @@
     let parsedEntries = [];
     let initPromise = null;
 
-    /**
-     * Converts raw HTML stored in Diarium entries into clean, readable plain text.
-     */
     function cleanHtmlToPlainText(htmlString) {
       if (!htmlString) return "";
-
       const tempDiv = document.createElement("div");
       let formatted = htmlString;
 
-      // Replace list items with clean bullet points
       formatted = formatted.replace(/<li[^>]*>/gi, "• ");
       formatted = formatted.replace(/<\/li>/gi, "\n");
-
-      // Handle paragraphs and line breaks
       formatted = formatted.replace(/<\/p>/gi, "\n\n");
       formatted = formatted.replace(/<br\s*[\/]?>/gi, "\n");
       formatted = formatted.replace(/<\/div>/gi, "\n");
@@ -164,17 +160,12 @@
 
       tempDiv.innerHTML = formatted;
       let text = tempDiv.textContent || tempDiv.innerText || "";
-
-      // Clean up multiple excessive blank lines (3+ newlines to double newline)
       text = text.replace(/\n\s*\n\s*\n+/g, "\n\n").trim();
-
       return text;
     }
 
-    // Initialize SQL.js with explicit WASM locateFile path
     function initSqlEngine() {
       if (initPromise) return initPromise;
-      
       const statusBadge = document.getElementById('engineStatus');
       
       initPromise = initSqlJs({
@@ -196,7 +187,6 @@
       return initPromise;
     }
 
-    // Start loading engine immediately on page load
     initSqlEngine();
 
     const dropZone = document.getElementById('dropZone');
@@ -214,39 +204,93 @@
       if (e.target.files.length) handleFile(e.target.files[0]);
     });
 
+    // Robust Smart Date Parser for any Diarium schema variation
+    function parseRobustDate(rowObj) {
+      // 1. Check if explicit Date or CreationDate column exists
+      for (const key of ['Date', 'CreationDate', 'date', 'creation_date']) {
+        if (rowObj[key]) {
+          const d = new Date(rowObj[key]);
+          if (!isNaN(d.getTime())) return d;
+        }
+      }
+
+      // 2. Fall back to DiaryEntryId or first numeric column (Ticks / Timestamp)
+      for (const key of ['DiaryEntryId', 'Id', 'ID', 'id']) {
+        if (rowObj[key] !== undefined && rowObj[key] !== null) {
+          const val = Number(rowObj[key]);
+          if (!isNaN(val)) {
+            // .NET Ticks format check (> 10^16)
+            if (val > 100000000000000000) {
+              const ms = Number((BigInt(rowObj[key]) / 10000n) - 62135596800000n);
+              const d = new Date(ms);
+              if (!isNaN(d.getTime())) return d;
+            }
+            // Unix Seconds check
+            if (val < 10000000000) {
+              const d = new Date(val * 1000);
+              if (!isNaN(d.getTime())) return d;
+            }
+            // Unix Milliseconds check
+            const d = new Date(val);
+            if (!isNaN(d.getTime())) return d;
+          }
+        }
+      }
+
+      return new Date(); // Ultimate fallback
+    }
+
     async function handleFile(file) {
       try {
         const SQL = await initSqlEngine();
-        
         const arrayBuffer = await file.arrayBuffer();
         const uInt8Array = new Uint8Array(arrayBuffer);
         const db = new SQL.Database(uInt8Array);
 
-        // Read Entries table
-        const res = db.exec("SELECT DiaryEntryId, Heading, Text FROM Entries ORDER BY DiaryEntryId ASC;");
-        if (!res.length || !res[0].values) {
+        // Dynamically fetch table columns and records
+        const res = db.exec("SELECT * FROM Entries;");
+        if (!res.length || !res[0].values || !res[0].columns) {
           alert("No entry records found in the backup file.");
           return;
         }
 
+        const columns = res[0].columns;
         parsedEntries = res[0].values.map(row => {
-          const rawTick = BigInt(row[0]);
-          const ms = Number((rawTick / 10000n) - 62135596800000n);
-          const dateStr = isNaN(ms) ? "Invalid Date" : new Date(ms).toLocaleString();
-          const rawText = row[2] || "";
-          
+          // Map row array to an object with column names as keys
+          const rowObj = {};
+          columns.forEach((col, idx) => {
+            rowObj[col] = row[idx];
+          });
+
+          const dateObj = parseRobustDate(rowObj);
+
+          // Use UTC date components to prevent timezone shift bugs & false dates
+          const year = dateObj.getUTCFullYear();
+          const month = String(dateObj.getUTCFullYear() ? dateObj.getUTCMonth() + 1 : 1).padStart(2, '0');
+          const day = String(dateObj.getUTCDate()).padStart(2, '0');
+          const dateKey = `${year}-${month}-${day}`;
+          const timeStr = dateObj.toLocaleTimeString();
+
+          // Find text and heading dynamically across possible column names
+          const rawText = rowObj.Text || rowObj.content || rowObj.Body || "";
+          const title = rowObj.Heading || rowObj.Title || rowObj.title || "";
+
           return {
-            dateStr,
-            title: row[1] || "",
-            rawText: rawText,
+            dateKey,
+            timeStr,
+            dateStr: dateObj.toUTCString(),
+            title,
+            rawText,
             cleanText: cleanHtmlToPlainText(rawText)
           };
         });
 
-        // Show summary & preview
+        // Sort chronologically by date/time
+        parsedEntries.sort((a, b) => a.dateKey.localeCompare(b.dateKey) || a.timeStr.localeCompare(b.timeStr));
+
         document.getElementById('summaryContent').innerHTML = `
           <p><strong>Total Entries Found:</strong> ${parsedEntries.length}</p>
-          <p><strong>Date Range:</strong> ${parsedEntries[0]?.dateStr} — ${parsedEntries[parsedEntries.length - 1]?.dateStr}</p>
+          <p><strong>Date Range:</strong> ${parsedEntries[0]?.dateKey} — ${parsedEntries[parsedEntries.length - 1]?.dateKey}</p>
         `;
         
         document.getElementById('previewContainer').textContent = parsedEntries.slice(0, 3).map(e => 
@@ -261,7 +305,50 @@
       }
     }
 
-    // Export Handlers
+    // Export Obsidian Zip (Grouped by date, appending multiple entries safely)
+    document.getElementById('exportObsidianZipBtn').addEventListener('click', async () => {
+      if (!parsedEntries.length) return;
+      const zip = new JSZip();
+      
+      const grouped = {};
+      parsedEntries.forEach(e => {
+        if (!grouped[e.dateKey]) grouped[e.dateKey] = [];
+        grouped[e.dateKey].push(e);
+      });
+
+      for (const [dateKey, entries] of Object.entries(grouped)) {
+        let content = `---
+journal: daily
+journal-start-date: ${dateKey}
+journal-end-date: ${dateKey}
+journal-section: day
+tags:
+  - journal
+  - daily
+---
+
+# Daily Log - ${dateKey}
+`;
+
+        entries.forEach((e, idx) => {
+          if (idx > 0) {
+            content += `\n\n---\n\n### Additional Entry (${e.timeStr})\n\n`;
+          } else {
+            content += `\n`;
+          }
+          if (e.title && e.title !== "Daily Log") {
+            content += `**${e.title}**\n\n`;
+          }
+          content += e.cleanText;
+        });
+
+        zip.file(`${dateKey}.md`, content);
+      }
+
+      const content = await zip.generateAsync({ type: "blob" });
+      downloadFile(content, 'Obsidian_Diarium_Vault.zip', 'application/zip');
+    });
+
     document.getElementById('exportTxtBtn').addEventListener('click', () => {
       if (!parsedEntries.length) return;
       const content = parsedEntries.map(e => 
@@ -293,7 +380,6 @@
           );
         }
 
-        // Split cleaned text into individual lines to maintain paragraph breaks
         e.cleanText.split('\n').forEach(line => {
           paragraphs.push(new docx.Paragraph({ text: line }));
         });
